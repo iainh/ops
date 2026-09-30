@@ -370,7 +370,7 @@ type RunConfig struct {
 
 	// Nics is a list of pre-configured network cards
 	// Meant to eventually deprecate the existing single-nic configuration
-	// Currently only supported for Proxmox
+	// Supported by Proxmox and vSphere (BridgeName selects each vSphere portgroup)
 	Nics []Nic `json:",omitempty"`
 
 	// Background runs unikernel in background

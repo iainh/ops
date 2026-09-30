@@ -5,6 +5,7 @@ package vsphere
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/nanovms/ops/lepton"
 	"github.com/nanovms/ops/log"
+	opsTypes "github.com/nanovms/ops/types"
 	"github.com/olekukonko/tablewriter"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/govc/host/esxcli"
@@ -24,6 +26,40 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
+
+type networkBackingResolver func(string) (types.BaseVirtualDeviceBackingInfo, error)
+
+func createNetworkDevices(existing object.VirtualDeviceList, nics []opsTypes.Nic, fallbackNetwork string, resolve networkBackingResolver) (object.VirtualDeviceList, error) {
+	networks := []string{fallbackNetwork}
+	if len(nics) > 0 {
+		networks = make([]string, len(nics))
+		for i, nic := range nics {
+			networks[i] = strings.TrimSpace(nic.BridgeName)
+			if networks[i] == "" {
+				return nil, fmt.Errorf("vSphere NIC %d is missing BridgeName", i)
+			}
+		}
+	}
+
+	devices := make(object.VirtualDeviceList, 0, len(networks))
+	allDevices := append(object.VirtualDeviceList{}, existing...)
+	for i, network := range networks {
+		backing, err := resolve(network)
+		if err != nil {
+			return nil, fmt.Errorf("resolve vSphere network %q for NIC %d: %w", network, i, err)
+		}
+
+		device, err := object.EthernetCardTypes().CreateEthernetCard("vmxnet3", backing)
+		if err != nil {
+			return nil, fmt.Errorf("create vmxnet3 for NIC %d: %w", i, err)
+		}
+		device.GetVirtualDevice().Key = allDevices.NewKey()
+		devices = append(devices, device)
+		allDevices = append(allDevices, device)
+	}
+
+	return devices, nil
+}
 
 // CreateInstance - Creates instance on VSphere.
 // Currently we support pvsci adapter && vmnetx3 network driver.
@@ -61,6 +97,12 @@ func (v *Vsphere) CreateInstance(ctx *lepton.Context) error {
 	}
 
 	f := find.NewFinder(v.client, true)
+	dc, err := f.DatacenterOrDefault(context.TODO(), v.datacenter)
+	if err != nil {
+		return err
+	}
+	f.SetDatacenter(dc)
+
 	ds, err := f.DatastoreOrDefault(context.TODO(), v.datastore)
 	if err != nil {
 		log.Error(err)
@@ -81,27 +123,21 @@ func (v *Vsphere) CreateInstance(ctx *lepton.Context) error {
 	// end add disk
 
 	// add network
-	// infer network stub
-	net, err := f.NetworkOrDefault(context.TODO(), v.network)
+	networkDevices, err := createNetworkDevices(devices, ctx.Config().RunConfig.Nics, v.network, func(networkName string) (types.BaseVirtualDeviceBackingInfo, error) {
+		net, err := f.NetworkOrDefault(context.TODO(), networkName)
+		if err != nil {
+			return nil, err
+		}
+		return net.EthernetCardBackingInfo(context.TODO())
+	})
 	if err != nil {
-		log.Error(err)
+		return err
 	}
-
-	backing, err := net.EthernetCardBackingInfo(context.TODO())
-	if err != nil {
-		log.Error(err)
-	}
-
-	device, err := object.EthernetCardTypes().CreateEthernetCard("vmxnet3", backing)
-	if err != nil {
-		log.Error(err)
-	}
-
-	devices = append(devices, device)
+	devices = append(devices, networkDevices...)
 
 	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
 	if err != nil {
-		log.Error(err)
+		return err
 	}
 
 	spec.DeviceChange = deviceChange
@@ -110,22 +146,14 @@ func (v *Vsphere) CreateInstance(ctx *lepton.Context) error {
 
 	datastorez = ds
 
-	dc, err := f.DatacenterOrDefault(context.TODO(), v.datacenter)
+	folder, err := f.FolderOrDefault(context.TODO(), v.vmFolder)
 	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	folders, err := dc.Folders(context.TODO())
-	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("resolve vSphere VM folder %q: %w", v.vmFolder, err)
 	}
 
 	spec.Files = &types.VirtualMachineFileInfo{
 		VmPathName: fmt.Sprintf("[%s]", datastorez.Name()),
 	}
-
-	folder := folders.VmFolder
 
 	pool, err := f.ResourcePoolOrDefault(context.TODO(), v.resourcePool)
 	if err != nil {
@@ -191,16 +219,6 @@ func (v *Vsphere) CreateInstance(ctx *lepton.Context) error {
 		log.Error(err)
 	}
 
-	task, err = vm.PowerOn(context.TODO())
-	if err != nil {
-		return err
-	}
-
-	_, err = task.WaitForResult(context.TODO())
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -225,7 +243,7 @@ func (v *Vsphere) GetInstanceByName(ctx *lepton.Context, name string) (*lepton.C
 		return nil, lepton.ErrInstanceNotFound(name)
 	}
 
-	return v.convertToCloudInstance(&vms[0]), nil
+	return v.convertToCloudInstance(&vms[0], true), nil
 }
 
 // GetInstances return all instances on vSphere
@@ -247,8 +265,9 @@ func (v *Vsphere) GetInstances(ctx *lepton.Context) ([]lepton.CloudInstance, err
 		return nil, err
 	}
 
+	includeIP := !ctx.Config().RunConfig.JSON
 	for _, vm := range vms {
-		cInstance := v.convertToCloudInstance(&vm)
+		cInstance := v.convertToCloudInstance(&vm, includeIP)
 
 		cinstances = append(cinstances, *cInstance)
 	}
@@ -256,7 +275,7 @@ func (v *Vsphere) GetInstances(ctx *lepton.Context) ([]lepton.CloudInstance, err
 	return cinstances, nil
 }
 
-func (v *Vsphere) convertToCloudInstance(vm *mo.VirtualMachine) *lepton.CloudInstance {
+func (v *Vsphere) convertToCloudInstance(vm *mo.VirtualMachine, includeIP bool) *lepton.CloudInstance {
 	cInstance := lepton.CloudInstance{
 		Name:   vm.Summary.Config.Name,
 		Status: string(vm.Summary.Runtime.PowerState),
@@ -266,7 +285,7 @@ func (v *Vsphere) convertToCloudInstance(vm *mo.VirtualMachine) *lepton.CloudIns
 		cInstance.Created = vm.Summary.Runtime.BootTime.String()
 	}
 
-	if cInstance.Status == "poweredOn" {
+	if includeIP && cInstance.Status == "poweredOn" {
 		ip := v.ipFor(vm.Summary.Config.Name)
 		cInstance.PublicIps = []string{ip}
 	}
@@ -282,6 +301,10 @@ func (v *Vsphere) ListInstances(ctx *lepton.Context) error {
 	cInstances, err := v.GetInstances(ctx)
 	if err != nil {
 		return err
+	}
+
+	if ctx.Config().RunConfig.JSON {
+		return json.NewEncoder(os.Stdout).Encode(cInstances)
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
@@ -579,12 +602,31 @@ func (v *Vsphere) PrintInstanceLogs(ctx *lepton.Context, instancename string, wa
 // logs don't appear until you spin up the instance.
 func (v *Vsphere) GetInstanceLogs(ctx *lepton.Context, instancename string) (string, error) {
 	f := find.NewFinder(v.client, true)
-	ds, err := f.DatastoreOrDefault(context.TODO(), v.datastore)
+	dc, err := f.DatacenterOrDefault(context.TODO(), v.datacenter)
+	if err != nil {
+		return "", err
+	}
+	f.SetDatacenter(dc)
+
+	vm, err := f.VirtualMachine(context.TODO(), instancename)
+	if err != nil {
+		return "", err
+	}
+	var mvm mo.VirtualMachine
+	if err := vm.Properties(context.TODO(), vm.Reference(), []string{"config.files.logDirectory"}, &mvm); err != nil {
+		return "", err
+	}
+
+	var logDirectory object.DatastorePath
+	if !logDirectory.FromString(mvm.Config.Files.LogDirectory) {
+		return "", fmt.Errorf("invalid vSphere log directory %q for instance %q", mvm.Config.Files.LogDirectory, instancename)
+	}
+	ds, err := f.DatastoreOrDefault(context.TODO(), logDirectory.Datastore)
 	if err != nil {
 		return "", err
 	}
 
-	serialFile := instancename + "/console.log"
+	serialFile := path.Join(logDirectory.Path, "console.log")
 	file, err := ds.Open(context.TODO(), serialFile)
 	if err != nil {
 		return "", err

@@ -29,6 +29,7 @@ type Vsphere struct {
 	datastore    string
 	network      string
 	resourcePool string
+	vmFolder     string
 }
 
 // NewProvider Vsphere
@@ -47,6 +48,7 @@ func (v *Vsphere) Initialize(config *types.ProviderConfig) error {
 	ds := os.Getenv("GOVC_DATASTORE")
 	nw := os.Getenv("GOVC_NETWORK")
 	rp := os.Getenv("GOVC_RESOURCE_POOL")
+	v.vmFolder = os.Getenv("GOVC_VM_FOLDER")
 
 	v.datacenter = "/ha-datacenter/"
 	if dc != "" {

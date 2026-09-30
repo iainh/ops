@@ -428,7 +428,7 @@ func BuildManifest(c *types.Config) (*fs.Manifest, error) {
 	}
 
 	// new many nics/instance
-	// only for proxmox atm
+	// used by Proxmox and vSphere
 	// this overrides anything in legacy RunConfig ip address setting
 	nics := c.RunConfig.Nics
 	for i := 0; i < len(nics); i++ {
